@@ -129,7 +129,7 @@ if result.ready:
 
 ## 6. 아직 주문에 연결되지 않은 부분
 
-현재 `bot.py`는 기존 현물 1분봉 SMA5/20 봇이다. 선물 쪽은 신호(`futures_strategy.py`), 시장 근거(`market_evidence.py`), 체크리스트(`trade_checklist.py`), 위험 및 주문 계획(`futures_risk.py`, `futures_system.py`)까지 구현되어 있다. 실제 선물 실행에는 다음 작업이 추가로 필요하다.
+현재 `bot.py`는 기존 현물 1분봉 SMA5/20 봇이다. 선물 쪽은 신호(`futures_strategy.py`), 시장 근거(`market_evidence.py`), 체크리스트(`trade_checklist.py`), 위험 및 주문 계획(`futures_risk.py`, `futures_system.py`)과 공개 데이터 기반 로컬 모의매매 실행기(`futures_paper.py`)까지 구현되어 있다. 실제 선물 주문 실행에는 다음 작업이 추가로 필요하다.
 
 - USDT-M 선물 데이터와 계정 상태 조회
 - 격리 마진·단방향 모드·레버리지 검증

@@ -46,8 +46,36 @@ class PaperState:
             self.lock.close()
             raise RuntimeError("Another futures paper bot uses this state database")
         self.db = sqlite3.connect(path)
+        self.db.execute("PRAGMA busy_timeout=5000")
         self.db.execute(
             "CREATE TABLE IF NOT EXISTS state (id INTEGER PRIMARY KEY, data TEXT)"
+        )
+        self.db.execute(
+            """
+            CREATE TABLE IF NOT EXISTS events (
+                candle INTEGER PRIMARY KEY,
+                event TEXT NOT NULL,
+                payload TEXT NOT NULL,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            )
+            """
+        )
+        self.db.execute(
+            """
+            CREATE TABLE IF NOT EXISTS trades (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                opened_at INTEGER NOT NULL UNIQUE,
+                closed_at INTEGER NOT NULL,
+                side TEXT NOT NULL,
+                entry_price REAL NOT NULL,
+                exit_price REAL NOT NULL,
+                quantity REAL NOT NULL,
+                gross_pnl REAL NOT NULL,
+                fees REAL NOT NULL,
+                net_pnl REAL NOT NULL,
+                reason TEXT NOT NULL
+            )
+            """
         )
         row = self.db.execute("SELECT data FROM state WHERE id=1").fetchone()
         self.data = (
@@ -72,6 +100,38 @@ class PaperState:
         payload = json.dumps(self.data, separators=(",", ":"))
         self.db.execute("INSERT OR REPLACE INTO state VALUES (1,?)", (payload,))
         self.db.commit()
+
+    def record_event(self, candle, event, payload):
+        self.db.execute(
+            "INSERT OR IGNORE INTO events (candle,event,payload) VALUES (?,?,?)",
+            (
+                candle,
+                event,
+                json.dumps(payload, ensure_ascii=False, separators=(",", ":")),
+            ),
+        )
+
+    def record_trade(self, trade):
+        self.db.execute(
+            """
+            INSERT OR IGNORE INTO trades (
+                opened_at,closed_at,side,entry_price,exit_price,quantity,
+                gross_pnl,fees,net_pnl,reason
+            ) VALUES (?,?,?,?,?,?,?,?,?,?)
+            """,
+            (
+                trade["opened_at"],
+                trade["closed_at"],
+                trade["side"],
+                trade["entry_price"],
+                trade["exit_price"],
+                trade["quantity"],
+                trade["gross_pnl"],
+                trade["fees"],
+                trade["net_pnl"],
+                trade["reason"],
+            ),
+        )
 
 
 def closed_candles(exchange, symbol, timeframe, limit):
@@ -187,6 +247,12 @@ def _emit(**values):
     print(json.dumps(values, ensure_ascii=False, separators=(",", ":")), flush=True)
 
 
+def _record_event(state, candle, event, **values):
+    payload = {"event": event, **values}
+    state.record_event(candle, event, payload)
+    _emit(**payload)
+
+
 def paper_step(
     exchange,
     state,
@@ -255,11 +321,14 @@ def paper_step(
         }
         state.data["trades"] = (state.data["trades"] + [trade])[-100:]
         state.data["position"] = None
-        _emit(event="exit", balance=state.data["balance"], **trade)
+        state.record_trade(trade)
+        _record_event(state, stamp, "exit", balance=state.data["balance"], **trade)
     elif decision.action in {Action.HOLD_LONG, Action.HOLD_SHORT}:
         state.data["position"]["stop_price"] = decision.stop_price
-        _emit(
-            event="hold",
+        _record_event(
+            state,
+            stamp,
+            "hold",
             side=position.side,
             mark_price=mark_price,
             stop_price=decision.stop_price,
@@ -299,8 +368,10 @@ def paper_step(
                 "entry_fee": entry_fee,
                 "opened_at": stamp,
             }
-            _emit(
-                event="entry",
+            _record_event(
+                state,
+                stamp,
+                "entry",
                 side=side,
                 entry_price=entry_price,
                 stop_price=plan.stop_price,
@@ -309,16 +380,20 @@ def paper_step(
                 open_interest=open_interest,
             )
         else:
-            _emit(
-                event="blocked",
+            _record_event(
+                state,
+                stamp,
+                "blocked",
                 action=decision.action.value,
                 mark_price=mark_price,
                 open_interest=open_interest,
                 reasons=result.blocked_reasons,
             )
     else:
-        _emit(
-            event="wait",
+        _record_event(
+            state,
+            stamp,
+            "wait",
             regime=decision.regime.value,
             mark_price=mark_price,
             equity=equity,

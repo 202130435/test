@@ -5,3 +5,6 @@ __pycache__/
 *.sqlite3-*
 .env
 *.sqlite3.lock
+*.log
+backups/
+exports/

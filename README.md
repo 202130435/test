@@ -1,6 +1,6 @@
 # 바이낸스 현물 매매 봇
 
-선물용 다중 시간대 전략은 [STRATEGY.md](STRATEGY.md), 강의에서 추출한 체크리스트·리스크 규칙은 [COURSE_SPEC.md](COURSE_SPEC.md)에 정리되어 있습니다. `futures_paper.py`로 공개 선물 데이터를 이용한 로컬 모의매매를 실행할 수 있으며 거래소 주문은 보내지 않습니다.
+선물용 다중 시간대 전략은 [STRATEGY.md](STRATEGY.md), 강의에서 추출한 체크리스트·리스크 규칙은 [COURSE_SPEC.md](COURSE_SPEC.md)에 정리되어 있습니다. `futures_paper.py`로 공개 선물 데이터를 이용한 로컬 모의매매를 실행할 수 있으며 거래소 주문은 보내지 않습니다. 집 컴퓨터 없이 VPS에서 BTC·ETH·SOL을 24시간 수집하는 방법은 [DEPLOYMENT.md](DEPLOYMENT.md)를 따릅니다.
 
 Python 3.12 / CCXT. 기본은 실제 시세를 이용한 로컬 모의매매입니다. 바이낸스 테스트넷 주문과는 다릅니다.
 
@@ -34,9 +34,17 @@ Python 3.12 / CCXT. 기본은 실제 시세를 이용한 로컬 모의매매입�
 - 수익 중인 포지션에 확인 신호가 있을 때만 추가 진입을 허용하고, 손절 확대와 물타기를 차단했습니다.
 - 25%씩 네 번 나누는 익절 계획을 선택 기능으로 구현했습니다.
 
+### 24시간 데이터 수집
+
+- Docker Compose로 BTC·ETH·SOL 모의매매를 각각 독립 실행할 수 있습니다.
+- 모든 15분봉 판단과 모든 청산 거래를 SQLite 테이블에 제한 없이 누적합니다.
+- 실행 중에도 안전한 DB 백업과 JSON·CSV 내보내기를 지원합니다.
+- systemd로 서버 부팅 시 자동 시작하고 하루 한 번 DB를 백업할 수 있습니다.
+- Docker 로그는 크기와 파일 수를 제한해 서버 디스크가 로그로 가득 차는 것을 막습니다.
+
 ### 현재 검증 상태와 다음 작업
 
-- 전체 자동 테스트 **46개**가 통과했습니다.
+- 전체 자동 테스트 **49개**가 통과했습니다.
 - Python 문법 검사와 의존성 검사도 통과했습니다.
 - 현물 주문 경로는 구현됐지만 실제 계정에서 검증하지 않았습니다.
 - 선물 모의매매 실행기는 공개 USDT-M 시세로 가상 진입·청산·손익 기록까지 수행하지만 거래소 주문을 전송하지 않습니다.
@@ -99,7 +107,15 @@ Windows PowerShell에서 한 번만 실행해 상태를 확인하려면:
 .\.venv\Scripts\python.exe futures_paper.py --allow-short --state futures-paper-long-short.sqlite3
 ```
 
-프로그램은 매분 확인하지만 새 15분봉이 완성됐을 때만 전략을 처리합니다. `wait`, `blocked`, `entry`, `hold`, `exit` 이벤트를 JSON 한 줄로 출력하고 상태와 최근 100개 청산 기록을 `futures-paper.sqlite3`에 저장합니다. 설정을 변경할 때는 다른 `--state` 파일을 지정해야 합니다.
+프로그램은 매분 확인하지만 새 15분봉이 완성됐을 때만 전략을 처리합니다. `wait`, `blocked`, `entry`, `hold`, `exit` 이벤트를 JSON 한 줄로 출력하고 `futures-paper.sqlite3`에 저장합니다. 상태 JSON에는 빠른 조회용 최근 100개 청산 기록을 유지하고, 전체 기록은 별도 테이블에 보존합니다. 설정을 변경할 때는 다른 `--state` 파일을 지정해야 합니다.
+
+DB의 `events` 테이블에는 모든 15분봉 판단, `trades` 테이블에는 모든 청산 거래가 제한 없이 누적됩니다. 상태 확인과 실행 중 백업·CSV 내보내기는 다음처럼 사용할 수 있습니다.
+
+```powershell
+.\.venv\Scripts\python.exe paper_data.py status --state futures-paper.sqlite3
+.\.venv\Scripts\python.exe paper_data.py backup --state futures-paper.sqlite3 --output backup.sqlite3
+.\.venv\Scripts\python.exe paper_data.py export --state futures-paper.sqlite3 --output-dir exports\btc-v1
+```
 
 엄격 체크리스트가 기본이며 상대 거래량, 최근 거래 집중 가격대, 가격 구조와 공개 OI 검토를 통과해야 진입합니다. 현재 펀딩비는 위험 버퍼에만 반영하고 실제 펀딩 지급·수취는 가상 잔고에 반영하지 않습니다. 과거 수익률이나 실거래 수익을 보장하지 않습니다.
 

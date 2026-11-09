@@ -93,6 +93,8 @@ def test_paper_entry_deduplication_and_exit(tmp_path, capsys):
     assert state.data["position"] is None
     assert len(state.data["trades"]) == 1
     assert state.data["daily"]["trade_count"] == 1
+    assert state.db.execute("SELECT COUNT(*) FROM events").fetchone()[0] == 2
+    assert state.db.execute("SELECT COUNT(*) FROM trades").fetchone()[0] == 1
 
 
 def test_equity_marks_long_and_short_positions():

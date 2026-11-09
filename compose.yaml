@@ -1,0 +1,109 @@
+name: coin-paper
+
+x-paper-service: &paper-service
+  image: coin-paper:local
+  build:
+    context: .
+  init: true
+  restart: unless-stopped
+  user: "${PAPER_UID:-1000}:${PAPER_GID:-1000}"
+  depends_on:
+    init-data:
+      condition: service_completed_successfully
+  volumes:
+    - paper-data:/data
+  logging:
+    driver: json-file
+    options:
+      max-size: 10m
+      max-file: "5"
+
+services:
+  init-data:
+    image: coin-paper:local
+    build:
+      context: .
+    user: "0:0"
+    restart: "no"
+    command:
+      - sh
+      - -c
+      - "chown -R ${PAPER_UID:-1000}:${PAPER_GID:-1000} /data"
+    volumes:
+      - paper-data:/data
+
+  btc:
+    <<: *paper-service
+    command:
+      - python
+      - futures_paper.py
+      - --symbol
+      - BTC/USDT:USDT
+      - --allow-short
+      - --state
+      - /data/btc-v1.sqlite3
+    healthcheck:
+      test: ["CMD", "python", "paper_data.py", "status", "--state", "/data/btc-v1.sqlite3"]
+      interval: 5m
+      timeout: 15s
+      retries: 3
+      start_period: 2m
+
+  eth:
+    <<: *paper-service
+    command:
+      - python
+      - futures_paper.py
+      - --symbol
+      - ETH/USDT:USDT
+      - --allow-short
+      - --state
+      - /data/eth-v1.sqlite3
+    healthcheck:
+      test: ["CMD", "python", "paper_data.py", "status", "--state", "/data/eth-v1.sqlite3"]
+      interval: 5m
+      timeout: 15s
+      retries: 3
+      start_period: 2m
+
+  sol:
+    <<: *paper-service
+    command:
+      - python
+      - futures_paper.py
+      - --symbol
+      - SOL/USDT:USDT
+      - --allow-short
+      - --state
+      - /data/sol-v1.sqlite3
+    healthcheck:
+      test: ["CMD", "python", "paper_data.py", "status", "--state", "/data/sol-v1.sqlite3"]
+      interval: 5m
+      timeout: 15s
+      retries: 3
+      start_period: 2m
+
+  backup:
+    image: coin-paper:local
+    build:
+      context: .
+    profiles: ["tools"]
+    restart: "no"
+    user: "${PAPER_UID:-1000}:${PAPER_GID:-1000}"
+    depends_on:
+      init-data:
+        condition: service_completed_successfully
+    command:
+      - python
+      - paper_data.py
+      - backup-all
+      - --data-dir
+      - /data
+      - --output-dir
+      - /backups
+    volumes:
+      - paper-data:/data
+      - ./backups:/backups
+
+volumes:
+  paper-data:

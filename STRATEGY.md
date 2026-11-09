@@ -74,56 +74,62 @@
 
 숏은 반대 조건으로 동작한다. 이 전략에서 “헤지”의 기본 의미는 반대 포지션을 동시에 잡는 것이 아니라 위험 자산 노출을 0으로 만드는 것이다. 양방향 포지션은 수수료·증거금·복구 상태를 복잡하게 만들기 때문에 포함하지 않았다.
 
-## 4. 포지션 크기
+## 4. 포지션 크기와 일일 중단
 
 기본 위험 한도는 거래당 계좌 평가금의 0.5%, 레버리지 상한은 2배다.
 
 ```text
-허용 손실액 = 계좌 평가금 × 0.005 × 위험 배수
-가격 위험 = |진입가 - 손절가|
-위험 기준 수량 = 허용 손실액 / 가격 위험
+허용 손실액 = 기준 평가금 × 0.005 × 위험 배수
+단위당 손실 = |진입가 - 손절가| + 예상 왕복 수수료
+              + 예상 왕복 슬리피지 + 펀딩 버퍼
+위험 기준 수량 = 허용 손실액 / 단위당 손실
 레버리지 기준 최대 수량 = 계좌 평가금 × 2 / 진입가
 
 최종 수량 = min(위험 기준 수량, 레버리지 기준 최대 수량)
 ```
 
-예를 들어 평가금이 1,000 USDT이고 진입가 100, 손절가 95라면 기본 허용 손실은 5 USDT, 계산 수량은 1개다. 거래소 수수료·슬리피지·펀딩비는 별도로 차감해야 하므로 주문 실행 모듈에서는 계산 수량보다 조금 줄여야 한다.
+`futures_risk.py`는 이 계산에 예상 비용을 포함하고, 일일 3R·연속 손실 3회·하루 6회 거래에서 세션을 중단하는 개발 시작값을 제공한다. 이 수치는 강의에서 제시한 값이 아니며 백테스트로 조정해야 한다. 자세한 구분은 [COURSE_SPEC.md](COURSE_SPEC.md)를 따른다.
 
 ## 5. 코드 사용 예
 
 ```python
-from futures_strategy import Position, StrategyConfig, decide, position_size
+from futures_risk import DailyRiskState
+from futures_system import plan_entry
+from trade_checklist import ChecklistAssessment
 
-config = StrategyConfig(
-    allow_short=False,
-    risk_fraction=0.005,
-    max_leverage=2,
+assessment = ChecklistAssessment(
+    signal_reviewed=True,
+    location_reviewed=True,
+    location_valid=True,
+    timeframe_reviewed=True,
+    timeframe_aligned=True,
+    volume_reviewed=True,
+    volume_confirmed=True,
+    repeated_signal_risk_reviewed=True,
+    structure_reviewed=True,
+    structure_confirmed=True,
+    oi_reviewed=True,
 )
 
-decision = decide(
+result = plan_entry(
     daily=closed_daily_candles,
     four_hour=closed_4h_candles,
     trigger_candles=closed_15m_candles,
-    position=Position(),
-    config=config,
+    assessment=assessment,
+    equity=account_equity,
+    leverage=2,
+    daily_state=DailyRiskState("2026-11-09", account_equity),
 )
 
-if decision.action.value == "enter_long":
-    entry = closed_15m_candles[-1][4]
-    quantity = position_size(
-        equity=account_equity,
-        entry_price=entry,
-        stop_price=decision.stop_price,
-        config=config,
-        risk_multiplier=decision.risk_multiplier,
-    )
+if result.ready:
+    print(result.trade_plan)
 ```
 
-`Decision.reasons`에는 매수·매도·관망 판단 근거가 들어 있다. 이를 로그와 모바일 알림에 그대로 사용할 수 있다.
+`result.decision.reasons`에는 전략 근거, `result.blocked_reasons`에는 체크리스트 또는 위험 차단 사유가 들어 있다. 이를 거래 일지와 모바일 알림에 사용할 수 있다.
 
 ## 6. 아직 주문에 연결되지 않은 부분
 
-이 모듈은 전략 논리를 검증하기 위한 단계다. 현재 `bot.py`는 기존 현물 1분봉 SMA5/20 봇이며, 선물 주문을 보내지 않는다. 실제 선물 실행에는 다음 작업이 추가로 필요하다.
+현재 `bot.py`는 기존 현물 1분봉 SMA5/20 봇이다. 선물 쪽은 신호(`futures_strategy.py`), 시장 근거(`market_evidence.py`), 체크리스트(`trade_checklist.py`), 위험 및 주문 계획(`futures_risk.py`, `futures_system.py`)까지 구현되어 있다. 실제 선물 실행에는 다음 작업이 추가로 필요하다.
 
 - USDT-M 선물 데이터와 계정 상태 조회
 - 격리 마진·단방향 모드·레버리지 검증

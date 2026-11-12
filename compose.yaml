@@ -83,6 +83,41 @@ services:
       retries: 3
       start_period: 2m
 
+  dashboard:
+    image: coin-paper:local
+    build:
+      context: .
+    init: true
+    restart: unless-stopped
+    user: "${PAPER_UID:-1000}:${PAPER_GID:-1000}"
+    depends_on:
+      init-data:
+        condition: service_completed_successfully
+    command:
+      - uvicorn
+      - web_app:app
+      - --host
+      - 0.0.0.0
+      - --port
+      - "8000"
+    environment:
+      PAPER_DATA_DIR: /data
+    volumes:
+      - paper-data:/data:ro
+    ports:
+      - "127.0.0.1:${DASHBOARD_PORT:-8080}:8000"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=5)"]
+      interval: 1m
+      timeout: 10s
+      retries: 3
+      start_period: 20s
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: "5"
+
   backup:
     image: coin-paper:local
     build:

@@ -55,6 +55,21 @@ docker compose logs --tail=100 -f btc eth sol
 
 세 서비스는 서버가 재부팅되어도 Docker의 `unless-stopped` 정책으로 다시 시작한다. 각 서비스는 새 15분봉이 마감됐을 때만 전략을 처리한다.
 
+웹 대시보드는 서버 내부의 `http://127.0.0.1:8080`에서 실행된다. PC에서 SSH 터널로 안전하게 확인하려면 다음 명령을 실행한 상태에서 브라우저로 `http://127.0.0.1:8080`을 연다.
+
+```sh
+ssh -L 8080:127.0.0.1:8080 VPS사용자@VPS주소
+```
+
+휴대폰 등 여러 기기에서 사용하려면 VPS와 기기에 Tailscale을 설치한 뒤 VPS에서 비공개 HTTPS 주소를 만든다.
+
+```sh
+sudo tailscale serve --bg http://127.0.0.1:8080
+tailscale serve status
+```
+
+대시보드는 읽기 전용이지만 거래 내역이 포함된다. 인증과 HTTPS 없이 공인 IP의 8080 포트를 열지 않는다.
+
 상태 확인:
 
 ```sh

@@ -1,7 +1,8 @@
 """Binance USDT-M futures paper trader. It never submits an order."""
 
 import argparse
-from dataclasses import asdict
+from dataclasses import asdict, replace
+import copy
 from datetime import datetime, timezone
 import json
 import math
@@ -14,11 +15,14 @@ import ccxt
 import portalocker
 
 from connectivity import RegionRestricted
-from futures_risk import DailyRiskState, RiskConfig
+from futures_risk import DailyRiskState, RiskConfig, build_trade_plan, validate_liquidation_buffer
 from futures_strategy import Action, Position, StrategyConfig, atr, decide
 from futures_system import plan_entry
 from market_evidence import relative_volume_confirmed
 from trade_checklist import ChecklistAssessment
+from state_resources import cleanup_on_error
+
+TF_MS = {'15m': 900_000, '4h': 14_400_000, '1d': 86_400_000}
 
 
 class FuturesExchange(ccxt.binanceusdm):
@@ -38,6 +42,7 @@ class FuturesExchange(ccxt.binanceusdm):
 
 
 class PaperState:
+    @cleanup_on_error
     def __init__(self, path, identity, capital):
         self.lock = open(str(path) + ".lock", "a")
         try:
@@ -47,6 +52,10 @@ class PaperState:
             raise RuntimeError("Another futures paper bot uses this state database")
         self.db = sqlite3.connect(path)
         self.db.execute("PRAGMA busy_timeout=5000")
+        self.db.execute('PRAGMA journal_mode=WAL')
+        self.db.execute('''CREATE TABLE IF NOT EXISTS funding_payments (
+            opened_at INTEGER, timestamp INTEGER, rate REAL, mark_price REAL, pnl REAL,
+            PRIMARY KEY(opened_at,timestamp))''')
         self.db.execute(
             "CREATE TABLE IF NOT EXISTS state (id INTEGER PRIMARY KEY, data TEXT)"
         )
@@ -77,6 +86,8 @@ class PaperState:
             )
             """
         )
+        if 'funding_pnl' not in {r[1] for r in self.db.execute('PRAGMA table_info(trades)')}:
+            self.db.execute('ALTER TABLE trades ADD COLUMN funding_pnl REAL NOT NULL DEFAULT 0')
         row = self.db.execute("SELECT data FROM state WHERE id=1").fetchone()
         self.data = (
             json.loads(row[0])
@@ -116,8 +127,8 @@ class PaperState:
             """
             INSERT OR IGNORE INTO trades (
                 opened_at,closed_at,side,entry_price,exit_price,quantity,
-                gross_pnl,fees,net_pnl,reason
-            ) VALUES (?,?,?,?,?,?,?,?,?,?)
+                gross_pnl,fees,net_pnl,reason,funding_pnl
+            ) VALUES (?,?,?,?,?,?,?,?,?,?,?)
             """,
             (
                 trade["opened_at"],
@@ -130,15 +141,32 @@ class PaperState:
                 trade["fees"],
                 trade["net_pnl"],
                 trade["reason"],
+                trade.get('funding_pnl', 0.0),
             ),
         )
 
 
+def public_read(method, *args, **kwargs):
+    for attempt in range(3):
+        try:
+            return method(*args, **kwargs)
+        except (ccxt.NetworkError, ccxt.ExchangeNotAvailable):
+            if attempt == 2:
+                raise
+            time.sleep(2 ** attempt)
+
+
 def closed_candles(exchange, symbol, timeframe, limit):
-    candles = exchange.fetch_ohlcv(symbol, timeframe, limit=limit)
+    candles = public_read(exchange.fetch_ohlcv, symbol, timeframe, limit=limit)
+    now = exchange.milliseconds()
+    candles = [c for c in candles if int(c[0]) + TF_MS[timeframe] <= now]
     if len(candles) < 2:
         raise ValueError(f"Insufficient {timeframe} candles")
-    return candles[:-1]
+    if now - (int(candles[-1][0]) + TF_MS[timeframe]) >= TF_MS[timeframe]:
+        raise ccxt.NetworkError(f'Stale {timeframe} candles; skipping cycle')
+    if any(int(b[0]) - int(a[0]) != TF_MS[timeframe] for a, b in zip(candles, candles[1:])):
+        raise ccxt.NetworkError(f'Non-contiguous {timeframe} candles')
+    return candles
 
 
 def candle_session_id(timestamp_ms):
@@ -211,7 +239,10 @@ def automatic_assessment(
 def open_interest_reviewed(exchange, symbol):
     if not exchange.has.get("fetchOpenInterest"):
         return False, None
-    value = exchange.fetch_open_interest(symbol)
+    try:
+        value = public_read(exchange.fetch_open_interest, symbol)
+    except (ccxt.NetworkError, ccxt.ExchangeNotAvailable):
+        return False, None
     amount = value.get("openInterestAmount")
     if amount is None:
         amount = value.get("openInterestValue")
@@ -248,32 +279,36 @@ def _emit(**values):
 
 
 def _record_event(state, candle, event, **values):
+    if 'price' not in values:
+        values['price'] = next((values[k] for k in ('mark_price', 'exit_price', 'entry_price') if k in values), None)
     payload = {"event": event, **values}
     state.record_event(candle, event, payload)
     _emit(**payload)
 
 
-def paper_step(
+def _save_candle(state, daily_state, stamp, mark_price, risk_config):
+    equity = current_equity(state.data, mark_price)
+    daily_state = replace(daily_state, marked_equity_pnl=equity - daily_state.session_start_equity)
+    if equity <= 0:
+        state.data['bankrupt'] = True
+    if state.data.get('bankrupt'):
+        daily_state = replace(daily_state, halted=True, halt_reason='account insolvent')
+    elif daily_state.consumed_loss >= daily_state.daily_loss_limit(risk_config):
+        daily_state = replace(daily_state, halted=True, halt_reason='daily loss limit reached')
+    state.data['daily'] = asdict(daily_state)
+    state.data['candle'] = stamp
+    state.save()
+
+
+def _process_candle(
     exchange,
     state,
     args,
     strategy_config,
     risk_config,
     assessment_builder=automatic_assessment,
+    *, daily, four_hour, trigger, allow_entry=True,
 ):
-    daily = closed_candles(
-        exchange, args.symbol, "1d", strategy_config.regime_slow + 2
-    )
-    four_hour = closed_candles(
-        exchange, args.symbol, "4h", strategy_config.regime_slow + 2
-    )
-    trigger_limit = max(
-        strategy_config.trigger_slow + 2,
-        strategy_config.atr_period + 2,
-        strategy_config.swing_lookback + 2,
-        62,
-    )
-    trigger = closed_candles(exchange, args.symbol, "15m", trigger_limit)
     stamp = int(trigger[-1][0])
     mark_price = float(trigger[-1][4])
     if stamp <= state.data["candle"]:
@@ -281,10 +316,28 @@ def paper_step(
         return
 
     equity = current_equity(state.data, mark_price)
-    session_id = candle_session_id(stamp)
-    daily_state = _daily_state(state.data, session_id, equity)
+    session_id = candle_session_id(stamp + TF_MS['15m'] - 1)
+    # A new KST session starts at the opening equity of its first candle.
+    opening_equity = current_equity(state.data, float(trigger[-1][1]))
+    if opening_equity <= 0 or equity <= 0 or state.data.get('bankrupt'):
+        state.data['bankrupt'] = True
+    daily_state = _daily_state(state.data, session_id, max(opening_equity, 1e-12))
+    stored = state.data['position']
+    stop_crossed = stored and (float(trigger[-1][3]) <= stored['stop_price'] if stored['side'] == 'long'
+                              else float(trigger[-1][2]) >= stored['stop_price'])
+    funding_delta = settle_funding(exchange, state, args, trigger[-1], exit_at_open=bool(stop_crossed))
+    equity = current_equity(state.data, mark_price)
+    daily_state = replace(daily_state, marked_equity_pnl=equity - daily_state.session_start_equity,
+                          funding_pnl=daily_state.funding_pnl + funding_delta)
     position = _position(state.data)
     decision = decide(daily, four_hour, trigger, position, strategy_config)
+    if position.side != 'flat':
+        liquidation = state.data['position'].get('liquidation_price')
+        touched = liquidation and (float(trigger[-1][3]) <= liquidation if position.side == 'long'
+                                   else float(trigger[-1][2]) >= liquidation)
+        if touched and decision.reasons != ('protective stop crossed',):
+            decision = replace(decision, action=Action.EXIT_LONG if position.side == 'long' else Action.EXIT_SHORT,
+                               reasons=('approximate liquidation crossed',))
 
     if decision.action in {Action.EXIT_LONG, Action.EXIT_SHORT}:
         stored = state.data["position"]
@@ -293,6 +346,8 @@ def paper_step(
             candle_open = float(trigger[-1][1])
             stop = float(stored["stop_price"])
             base_exit = min(candle_open, stop) if side == "long" else max(candle_open, stop)
+        elif decision.reasons == ('approximate liquidation crossed',):
+            base_exit = float(stored['liquidation_price'])
         else:
             base_exit = mark_price
         exit_price = paper_fill(base_exit, side, False, args.slippage)
@@ -302,6 +357,7 @@ def paper_step(
         exit_fee = exit_price * quantity * args.fee
         total_fees = float(stored["entry_fee"]) + exit_fee
         state.data["balance"] += gross_pnl - exit_fee
+        daily_state = replace(daily_state, marked_equity_pnl=state.data['balance'] - daily_state.session_start_equity)
         daily_state = daily_state.record_closed_trade(
             gross_pnl=gross_pnl,
             fees=total_fees,
@@ -314,7 +370,8 @@ def paper_step(
             "quantity": quantity,
             "gross_pnl": gross_pnl,
             "fees": total_fees,
-            "net_pnl": gross_pnl - total_fees,
+            "net_pnl": gross_pnl - total_fees + stored.get('funding_pnl', 0.0),
+            'funding_pnl': stored.get('funding_pnl', 0.0),
             "opened_at": stored["opened_at"],
             "closed_at": stamp,
             "reason": decision.reasons[0],
@@ -324,18 +381,25 @@ def paper_step(
         state.record_trade(trade)
         _record_event(state, stamp, "exit", balance=state.data["balance"], **trade)
     elif decision.action in {Action.HOLD_LONG, Action.HOLD_SHORT}:
-        state.data["position"]["stop_price"] = decision.stop_price
+        rounded_stop = float(exchange.price_to_precision(args.symbol, decision.stop_price))
+        state.data["position"]["stop_price"] = (max(position.stop_price, rounded_stop)
+            if position.side == 'long' else min(position.stop_price, rounded_stop))
         _record_event(
             state,
             stamp,
             "hold",
             side=position.side,
             mark_price=mark_price,
-            stop_price=decision.stop_price,
+            stop_price=state.data['position']['stop_price'],
             equity=equity,
             reasons=decision.reasons,
         )
     elif decision.action in {Action.ENTER_LONG, Action.ENTER_SHORT}:
+        if not allow_entry or state.data.get('bankrupt') or state.data.get('recovery_halt'):
+            _record_event(state, stamp, 'blocked', mark_price=mark_price,
+                          reasons=['historical replay, unrecoverable gap or insolvent account: entry disabled'])
+            _save_candle(state, daily_state, stamp, mark_price, risk_config)
+            return
         side = "long" if decision.action == Action.ENTER_LONG else "short"
         oi_reviewed, open_interest = open_interest_reviewed(exchange, args.symbol)
         assessment = assessment_builder(
@@ -356,17 +420,35 @@ def paper_step(
             risk_config=risk_config,
         )
         if result.ready:
-            plan = result.trade_plan
             entry_price = paper_fill(mark_price, side, True, args.slippage)
-            entry_fee = entry_price * plan.quantity * args.fee
+            try:
+                stop_price = float(exchange.price_to_precision(args.symbol, result.trade_plan.stop_price))
+                plan = build_trade_plan(side, entry_price, stop_price, equity,
+                                        args.leverage, daily_state, risk_config, decision.risk_multiplier)
+                quantity = float(exchange.amount_to_precision(args.symbol, plan.quantity))
+                validate_paper_order(exchange, args.symbol, quantity, entry_price)
+                entry_fee = entry_price * quantity * args.fee
+                if entry_price * quantity / args.leverage + entry_fee > state.data['balance']:
+                    raise ValueError('insufficient free margin including entry fee')
+                # Approximation only: maintenance margin 0.5%; no exchange tier simulation.
+                liquidation = entry_price * (1 - 1 / args.leverage) / 0.995 if side == 'long' else entry_price * (1 + 1 / args.leverage) / 1.005
+                if not validate_liquidation_buffer(side, entry_price, plan.stop_price, liquidation):
+                    raise ValueError('insufficient liquidation buffer')
+            except (ValueError, RuntimeError, ccxt.InvalidOrder) as error:
+                _record_event(state, stamp, 'blocked', mark_price=mark_price, reasons=[str(error)])
+                _save_candle(state, daily_state, stamp, mark_price, risk_config)
+                return
             state.data["balance"] -= entry_fee
             state.data["position"] = {
                 "side": side,
                 "entry_price": entry_price,
                 "stop_price": plan.stop_price,
-                "quantity": plan.quantity,
+                "quantity": quantity,
                 "entry_fee": entry_fee,
                 "opened_at": stamp,
+                'funding_after': stamp + TF_MS['15m'],
+                'funding_pnl': 0.0,
+                'liquidation_price': liquidation,
             }
             _record_event(
                 state,
@@ -375,9 +457,10 @@ def paper_step(
                 side=side,
                 entry_price=entry_price,
                 stop_price=plan.stop_price,
-                quantity=plan.quantity,
+                quantity=quantity,
                 risk_budget=plan.risk_budget,
                 open_interest=open_interest,
+                reasons=decision.reasons,
             )
         else:
             _record_event(
@@ -400,9 +483,96 @@ def paper_step(
             reasons=decision.reasons,
         )
 
-    state.data["daily"] = asdict(daily_state)
-    state.data["candle"] = stamp
-    state.save()
+    _save_candle(state, daily_state, stamp, mark_price, risk_config)
+
+
+def validate_paper_order(exchange, symbol, quantity, price):
+    if not math.isfinite(quantity) or quantity <= 0:
+        raise ValueError('invalid rounded quantity')
+    market = exchange.market(symbol)
+    contract_size = market.get('contractSize') or 1
+    if contract_size != 1:
+        raise ValueError('paper executor supports unit-size linear contracts only')
+    for kind, value in (('amount', quantity), ('cost', quantity * price)):
+        limits = (market.get('limits', {}).get(kind) or {})
+        if limits.get('min') is not None and value < limits['min']:
+            raise ValueError(f'below exchange minimum {kind}')
+        if limits.get('max') is not None and value > limits['max']:
+            raise ValueError(f'above exchange maximum {kind}')
+
+
+def settle_funding(exchange, state, args, candle, exit_at_open=False):
+    stored = state.data['position']
+    if not stored:
+        return 0.0
+    # Legacy positions start at their actual entry close; retain a durable cursor.
+    after = stored.get('funding_after', stored['opened_at'] + TF_MS['15m'])
+    # Intrabar stop time is unknown; assume earliest execution and exclude later funding.
+    end = int(candle[0]) if exit_at_open else int(candle[0]) + TF_MS['15m']
+    if end <= after:
+        return 0.0
+    total = 0.0
+    cursor = after + 1
+    while cursor <= end:
+        rates = public_read(exchange.fetch_funding_rate_history, args.symbol, since=cursor,
+                            limit=1000, params={'endTime': end})
+        rates = sorted((r for r in rates if cursor <= r['timestamp'] <= end), key=lambda r: r['timestamp'])
+        for item in rates:
+            rate = float(item['fundingRate'])
+            mark = float(item.get('markPrice') or (item.get('info') or {}).get('markPrice') or candle[1])
+            if not math.isfinite(rate) or not math.isfinite(mark) or mark <= 0:
+                raise ValueError('invalid funding history')
+            pnl = -rate * mark * stored['quantity'] * (1 if stored['side'] == 'long' else -1)
+            inserted = state.db.execute('INSERT OR IGNORE INTO funding_payments VALUES (?,?,?,?,?)',
+                (stored['opened_at'], item['timestamp'], rate, mark, pnl)).rowcount
+            if inserted:
+                total += pnl
+        if len(rates) < 1000:
+            break
+        cursor = rates[-1]['timestamp'] + 1
+    state.data['balance'] += total
+    stored['funding_pnl'] = stored.get('funding_pnl', 0.0) + total
+    stored['funding_after'] = end
+    return total
+
+
+def paper_step(exchange, state, args, strategy_config, risk_config,
+               assessment_builder=automatic_assessment):
+    daily = closed_candles(exchange, args.symbol, '1d', 1000)
+    four_hour = closed_candles(exchange, args.symbol, '4h', 1000)
+    trigger = closed_candles(exchange, args.symbol, '15m', 1000)
+    last = state.data['candle']
+    pending = [i for i, c in enumerate(trigger) if c[0] > last]
+    if not pending:
+        _emit(event='already_processed', candle=trigger[-1][0])
+        return
+    if not last:
+        pending = [len(trigger) - 1]
+    elif trigger[pending[0]][0] > last + TF_MS['15m']:
+        state.data['recovery_halt'] = True
+        _record_event(state, last + 1, 'gap_warning', reasons=['history window exceeded; new entries disabled'],
+                      missing_from=last + TF_MS['15m'], available_from=trigger[pending[0]][0])
+        state.save()
+    for index in pending:
+        end = int(trigger[index][0]) + TF_MS['15m']
+        d = [c for c in daily if c[0] + TF_MS['1d'] <= end]
+        h = [c for c in four_hour if c[0] + TF_MS['4h'] <= end]
+        if not d or not h or end - (d[-1][0] + TF_MS['1d']) >= TF_MS['1d'] or end - (h[-1][0] + TF_MS['4h']) >= TF_MS['4h']:
+            raise ccxt.NetworkError('Regime candles are not aligned with trigger close')
+        required = max(strategy_config.trigger_slow + 1, strategy_config.atr_period + 1,
+                       strategy_config.swing_lookback, 21)
+        if len(d) < strategy_config.regime_slow + 1 or len(h) < strategy_config.regime_slow + 1 or index + 1 < required:
+            # Never silently skip a candle that could have stopped an open position.
+            raise ccxt.NetworkError('Insufficient aligned history for replay; collect older history before resuming')
+        before = copy.deepcopy(state.data)
+        try:
+            _process_candle(exchange, state, args, strategy_config, risk_config, assessment_builder,
+                            daily=d, four_hour=h, trigger=trigger[:index + 1],
+                            allow_entry=index == len(trigger) - 1)
+        except BaseException:
+            state.db.rollback()
+            state.data = before
+            raise
 
 
 def main():
@@ -468,7 +638,7 @@ def main():
         }
     )
     exchange.session.trust_env = True
-    exchange.load_markets()
+    public_read(exchange.load_markets)
     market = exchange.market(args.symbol)
     if not market.get("contract") or market.get("linear") is False:
         parser.error("An active linear futures market is required")
@@ -491,11 +661,20 @@ def main():
         args.allow_short,
     ]
     state = PaperState(args.state, identity, args.capital)
-    while True:
-        paper_step(exchange, state, args, strategy_config, risk_config)
-        if args.once:
-            break
-        time.sleep(args.interval)
+    try:
+        while True:
+            try:
+                paper_step(exchange, state, args, strategy_config, risk_config)
+            except (ccxt.NetworkError, ccxt.ExchangeNotAvailable) as error:
+                _emit(event='network_skip', reason=type(error).__name__)
+                if args.once:
+                    raise
+            if args.once:
+                break
+            time.sleep(args.interval)
+    finally:
+        state.db.close()
+        state.lock.close()
 
 
 if __name__ == "__main__":

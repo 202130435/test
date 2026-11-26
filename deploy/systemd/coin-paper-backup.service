@@ -6,4 +6,5 @@ After=docker.service
 [Service]
 Type=oneshot
 WorkingDirectory=/opt/coin-bot
+ExecStartPre=/usr/bin/mkdir -p /opt/coin-bot/backups
 ExecStart=/usr/bin/docker compose --profile tools run --rm backup

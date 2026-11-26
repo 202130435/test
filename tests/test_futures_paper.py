@@ -13,10 +13,10 @@ from futures_strategy import StrategyConfig
 from trade_checklist import ChecklistAssessment
 
 
-def candles(closes, start=0, volumes=None):
+def candles(closes, start=0, volumes=None, interval=900_000):
     volumes = volumes or [1] * len(closes)
     return [
-        [start + index, close, close + 1, max(0.01, close - 1), close, volume]
+        [start + index * interval, close, close + 1, max(0.01, close - 1), close, volume]
         for index, (close, volume) in enumerate(zip(closes, volumes))
     ]
 
@@ -35,13 +35,33 @@ def turn_down(start=0):
 
 class Exchange:
     def __init__(self):
-        self.trigger = turn_up(1_700_000_000_000)
+        self.trigger = turn_up(1_700_006_400_000)
         self.has = {"fetchOpenInterest": True}
 
     def fetch_ohlcv(self, symbol, timeframe, limit):
-        values = rising() if timeframe in {"1d", "4h"} else self.trigger
-        forming = [values[-1][0] + 1, 0, 0, 0, values[-1][4], 0]
+        interval = {'1d': 86_400_000, '4h': 14_400_000, '15m': 900_000}[timeframe]
+        if timeframe in {'1d', '4h'}:
+            end = self.milliseconds() // interval * interval
+            values = candles([100 + i * .25 for i in range(220)], end - 220 * interval, interval=interval)
+        else:
+            values = self.trigger
+        forming = [values[-1][0] + interval, 0, 0, 0, values[-1][4], 0]
         return values + [forming]
+
+    def milliseconds(self):
+        return self.trigger[-1][0] + 900_000
+
+    def amount_to_precision(self, symbol, amount):
+        return str(int(amount * 1000) / 1000)
+
+    def price_to_precision(self, symbol, price):
+        return f'{price:.2f}'
+
+    def market(self, symbol):
+        return {'contractSize': 1, 'limits': {'amount': {'min': .001}, 'cost': {'min': 5}}}
+
+    def fetch_funding_rate_history(self, *unused, **kwargs):
+        return []
 
     def fetch_open_interest(self, symbol):
         return {"openInterestAmount": 1234}
@@ -88,7 +108,8 @@ def test_paper_entry_deduplication_and_exit(tmp_path, capsys):
     assert state.data["candle"] == first_candle
     assert "already_processed" in capsys.readouterr().out
 
-    exchange.trigger = turn_down(1_700_000_001_000)
+    next_candle = [first_candle + 900_000, 90, 91, 89, 90, 2]
+    exchange.trigger = exchange.trigger + [next_candle]
     paper_step(exchange, state, args(), strategy, risk, complete_assessment)
     assert state.data["position"] is None
     assert len(state.data["trades"]) == 1

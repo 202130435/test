@@ -28,9 +28,10 @@ services:
     command:
       - sh
       - -c
-      - "chown -R ${PAPER_UID:-1000}:${PAPER_GID:-1000} /data"
+      - "chown ${PAPER_UID:-1000}:${PAPER_GID:-1000} /data /backups"
     volumes:
       - paper-data:/data
+      - ./backups:/backups
 
   btc:
     <<: *paper-service
@@ -43,7 +44,7 @@ services:
       - --state
       - /data/btc-v1.sqlite3
     healthcheck:
-      test: ["CMD", "python", "paper_data.py", "status", "--state", "/data/btc-v1.sqlite3"]
+      test: ["CMD", "python", "paper_data.py", "status", "--state", "/data/btc-v1.sqlite3", "--max-age-seconds", "1800"]
       interval: 5m
       timeout: 15s
       retries: 3
@@ -60,7 +61,7 @@ services:
       - --state
       - /data/eth-v1.sqlite3
     healthcheck:
-      test: ["CMD", "python", "paper_data.py", "status", "--state", "/data/eth-v1.sqlite3"]
+      test: ["CMD", "python", "paper_data.py", "status", "--state", "/data/eth-v1.sqlite3", "--max-age-seconds", "1800"]
       interval: 5m
       timeout: 15s
       retries: 3
@@ -77,7 +78,7 @@ services:
       - --state
       - /data/sol-v1.sqlite3
     healthcheck:
-      test: ["CMD", "python", "paper_data.py", "status", "--state", "/data/sol-v1.sqlite3"]
+      test: ["CMD", "python", "paper_data.py", "status", "--state", "/data/sol-v1.sqlite3", "--max-age-seconds", "1800"]
       interval: 5m
       timeout: 15s
       retries: 3
@@ -103,7 +104,7 @@ services:
     environment:
       PAPER_DATA_DIR: /data
     volumes:
-      - paper-data:/data:ro
+      - paper-data:/data
     ports:
       - "127.0.0.1:${DASHBOARD_PORT:-8080}:8000"
     healthcheck:

@@ -54,6 +54,7 @@ def test_export_contains_state_events_trades_and_manifest(tmp_path):
         "state.json",
         "events.csv",
         "trades.csv",
+        "funding.csv",
     }
     assert json.loads((output / "state.json").read_text())["balance"] == 1_009.9
     with (output / "trades.csv").open(newline="") as handle:

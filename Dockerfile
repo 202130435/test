@@ -22,6 +22,4 @@ COPY --chown=paperbot:paperbot *.py ./
 
 USER paperbot
 
-VOLUME ["/data", "/backups"]
-
 CMD ["python", "futures_paper.py"]

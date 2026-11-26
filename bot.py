@@ -1,5 +1,6 @@
 """Binance spot SMA bot. Defaults to local paper execution."""
 import argparse
+import hashlib
 import json
 import os
 import sqlite3
@@ -9,17 +10,32 @@ import math
 
 import ccxt
 from connectivity import SpotExchange, RegionRestricted, public_read
+from state_resources import cleanup_on_error
 
 
 def signal(candles, fast, slow):
     if len(candles) < slow + 1:
         return None
     closes = [float(c[4]) for c in candles]
-    def above(end):
+    def difference(end):
         values = closes[:end] if end else closes
-        return sum(values[-fast:]) / fast > sum(values[-slow:]) / slow
-    previous, current = above(-1), above(0)
-    return 'buy' if current and not previous else 'sell' if previous and not current else None
+        return sum(values[-fast:]) / fast - sum(values[-slow:]) / slow
+    previous, current = difference(-1), difference(0)
+    return 'buy' if previous <= 0 < current else 'sell' if previous >= 0 > current else None
+
+
+def tradable_position(exchange, symbol, quantity, price):
+    amount = float(exchange.amount_to_precision(symbol, max(0, quantity)))
+    limits = exchange.market(symbol).get('limits', {})
+    return (amount > 0 and amount >= ((limits.get('amount') or {}).get('min') or 0)
+            and amount * price >= ((limits.get('cost') or {}).get('min') or 0))
+
+
+def collect_dust(exchange, data, symbol, price):
+    data['position'] = max(0.0, data['position'])
+    if not tradable_position(exchange, symbol, data['position'], price):
+        data['dust'] = data.get('dust', 0.0) + data['position']
+        data['position'] = 0.0
 
 
 def order_amount(exchange, symbol, budget, price):
@@ -38,6 +54,7 @@ def order_amount(exchange, symbol, budget, price):
 
 
 class State:
+    @cleanup_on_error
     def __init__(self, path, identity, cash):
         self.lock = open(str(path) + '.lock', 'a')
         try:
@@ -50,8 +67,12 @@ class State:
         row = self.db.execute('SELECT data FROM state WHERE id=1').fetchone()
         self.data = json.loads(row[0]) if row else dict(identity=identity, cash=cash, position=0, candle=0, pending=None)
         if self.data['identity'] != identity:
+            self.db.close()
+            self.lock.close()
             raise ValueError('State belongs to another mode/symbol/strategy; use another database')
         if self.data['pending']:
+            self.db.close()
+            self.lock.close()
             raise RuntimeError('Unresolved order: reconcile it with Binance before resuming; do not blindly retry')
         self.save()
     def save(self):
@@ -70,6 +91,7 @@ def step(exchange, state, args):
         return
     side = signal(closed, args.fast, args.slow)
     d = state.data
+    collect_dust(exchange, d, args.symbol, price)
     if (side == 'buy' and d['position'] == 0) or (side == 'sell' and d['position'] > 0):
         if side == 'buy':
             budget = min(args.quote_amount, d['cash'] / (1 + args.fee))
@@ -84,7 +106,8 @@ def step(exchange, state, args):
                 free = float(exchange.fetch_balance()['free'].get(exchange.market(args.symbol)['base'], 0))
                 if free < amount:
                     raise ValueError('Insufficient base balance; reconcile position')
-        client_id = f'spotbot-{stamp}-{side}'
+        symbol_tag = hashlib.sha256(args.symbol.encode()).hexdigest()[:8]
+        client_id = f'spotbot-{symbol_tag}-{stamp}-{side}'
         if args.live:
             # Durable intent precedes submission. Any uncertain result halts restart.
             d['pending'] = client_id
@@ -103,9 +126,8 @@ def step(exchange, state, args):
             d['position'] += filled - base_fee
         else:
             d['cash'] += cost - quote_fee
-            d['position'] -= filled + base_fee
-            if abs(d['position']) < 1e-12:
-                d['position'] = 0
+            d['position'] = max(0.0, d['position'] - filled - base_fee)
+            collect_dust(exchange, d, args.symbol, price)
         d['pending'] = None
         print(json.dumps(dict(side=side, amount=filled, cost=cost, mode='live' if args.live else 'paper')), flush=True)
     d['candle'] = stamp

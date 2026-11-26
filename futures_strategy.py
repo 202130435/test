@@ -92,8 +92,6 @@ class Position:
             for value in (self.entry_price, self.stop_price)
         ):
             raise ValueError("position prices must be finite and positive")
-        if self.stop_price == self.entry_price:
-            raise ValueError("stop must differ from entry")
 
 @dataclass(frozen=True)
 class Decision:

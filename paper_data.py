@@ -1,12 +1,21 @@
 """Inspect, export, and safely back up futures paper-trading databases."""
 
 import argparse
+from contextlib import closing
 import csv
 from datetime import datetime, timezone
 import hashlib
 import json
 from pathlib import Path
 import sqlite3
+import time
+
+
+def readonly_connection(path):
+    connection = sqlite3.connect(Path(path).resolve().as_uri() + '?mode=ro', uri=True, timeout=5)
+    connection.execute('PRAGMA query_only=ON')
+    connection.execute('PRAGMA busy_timeout=5000')
+    return connection
 
 
 def _require_database(path):
@@ -26,7 +35,8 @@ def file_sha256(path):
 
 def read_status(path):
     source = _require_database(path)
-    with sqlite3.connect(source) as database:
+    with closing(readonly_connection(source)) as database:
+        database.execute('BEGIN')
         row = database.execute("SELECT data FROM state WHERE id=1").fetchone()
         if row is None:
             raise ValueError("Paper database has no state row")
@@ -54,9 +64,9 @@ def backup_database(source_path, destination_path):
     if destination.exists():
         raise FileExistsError(f"Backup destination already exists: {destination}")
     destination.parent.mkdir(parents=True, exist_ok=True)
-    with sqlite3.connect(source) as source_database:
-        with sqlite3.connect(destination) as destination_database:
-            source_database.backup(destination_database)
+    with closing(readonly_connection(source)) as source_database:
+        with closing(sqlite3.connect(destination)) as destination_database:
+            source_database.backup(destination_database, pages=100, sleep=0.05)
     return {
         "source": str(source),
         "backup": str(destination),
@@ -80,7 +90,7 @@ def export_database(source_path, output_directory):
     snapshot = output / "snapshot.sqlite3"
     backup_database(source, snapshot)
 
-    with sqlite3.connect(snapshot) as database:
+    with closing(readonly_connection(snapshot)) as database:
         state_row = database.execute("SELECT data FROM state WHERE id=1").fetchone()
         if state_row is None:
             raise ValueError("Paper database has no state row")
@@ -102,8 +112,12 @@ def export_database(source_path, output_directory):
             """,
             output / "trades.csv",
         )
+        funding_exists = database.execute("SELECT 1 FROM sqlite_master WHERE name='funding_payments'").fetchone()
+        query = ('SELECT opened_at,timestamp,rate,mark_price,pnl FROM funding_payments ORDER BY timestamp'
+                 if funding_exists else 'SELECT NULL AS opened_at,NULL AS timestamp,NULL AS rate,NULL AS mark_price,NULL AS pnl WHERE 0')
+        _write_query_csv(database, query, output / 'funding.csv')
 
-    files = [snapshot, output / "state.json", output / "events.csv", output / "trades.csv"]
+    files = [snapshot, output / "state.json", output / "events.csv", output / "trades.csv", output / 'funding.csv']
     manifest = {
         "created_at": datetime.now(timezone.utc).isoformat(),
         "source": str(source),
@@ -148,6 +162,7 @@ def main():
 
     status_parser = commands.add_parser("status")
     status_parser.add_argument("--state", required=True)
+    status_parser.add_argument("--max-age-seconds", type=float)
 
     backup_parser = commands.add_parser("backup")
     backup_parser.add_argument("--state", required=True)
@@ -164,6 +179,13 @@ def main():
     args = parser.parse_args()
     if args.command == "status":
         result = read_status(args.state)
+        if args.max_age_seconds is not None:
+            if args.max_age_seconds <= 0:
+                parser.error('max-age-seconds must be positive')
+            result['stale'] = (time.time() - result['last_candle'] / 1000 > args.max_age_seconds)
+            if result['stale']:
+                print(json.dumps(result, ensure_ascii=False))
+                raise SystemExit(1)
     elif args.command == "backup":
         result = backup_database(args.state, args.output)
     elif args.command == "export":

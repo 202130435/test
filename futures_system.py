@@ -77,7 +77,7 @@ def plan_entry(
             config=risk_config,
             risk_multiplier=decision.risk_multiplier,
         )
-    except RuntimeError as error:
+    except (RuntimeError, ValueError) as error:
         return EntryPlanResult(
             decision=decision,
             checklist=checklist,

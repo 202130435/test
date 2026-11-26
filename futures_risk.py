@@ -51,6 +51,7 @@ class DailyRiskState:
     consecutive_losses: int = 0
     halted: bool = False
     halt_reason: str | None = None
+    marked_equity_pnl: float | None = None
 
     def __post_init__(self):
         if not self.session_id:
@@ -60,6 +61,8 @@ class DailyRiskState:
             raise ValueError("invalid daily risk state values")
         if self.fees_paid < 0 or self.trade_count < 0 or self.consecutive_losses < 0:
             raise ValueError("fees and counters cannot be negative")
+        if self.marked_equity_pnl is not None and not isfinite(self.marked_equity_pnl):
+            raise ValueError('invalid marked equity PnL')
 
     @property
     def net_realized_pnl(self) -> float:
@@ -67,7 +70,8 @@ class DailyRiskState:
 
     @property
     def consumed_loss(self) -> float:
-        return max(0.0, -self.net_realized_pnl)
+        pnl = self.net_realized_pnl if self.marked_equity_pnl is None else self.marked_equity_pnl
+        return max(0.0, -pnl)
 
     def standard_risk(self, config: RiskConfig) -> float:
         return self.session_start_equity * config.risk_fraction

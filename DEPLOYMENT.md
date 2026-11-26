@@ -124,7 +124,13 @@ docker compose --profile tools run --rm backup \
   --output-dir "/backups/btc-$stamp"
 ```
 
-출력 디렉터리에는 안전한 SQLite 스냅샷, `state.json`, `events.csv`, `trades.csv`, `manifest.json`이 생성된다.
+출력 디렉터리에는 안전한 SQLite 스냅샷, `state.json`, `events.csv`, `trades.csv`, `funding.csv`, `manifest.json`이 생성된다.
+
+트레이더는 WAL을 사용하며 읽기·백업 연결은 명시적으로 반환한다. 대시보드 볼륨은 WAL 공유를 위해
+읽기/쓰기로 마운트하되 앱 연결에 `mode=ro`와 `query_only=ON`을 적용한다.
+`init-data`가 `/data`와 호스트 `./backups`의 디렉터리 소유권을 설정한다.
+각 트레이더의 헬스체크는 마지막 15분봉이 1,800초보다 오래되면 실패한다.
+Docker는 unhealthy만으로 컨테이너를 자동 재시작하지 않으므로 별도 모니터링에서 확인해야 한다.
 
 ## systemd 자동 부팅과 매일 백업
 
@@ -148,6 +154,9 @@ systemctl list-timers coin-paper-backup.timer
 ```
 
 timer는 하루에 한 번 세 DB를 백업하며, 서버가 꺼져 있던 시간에 예정된 백업도 다음 부팅 후 실행한다.
+
+systemd 서비스는 `oneshot`으로 `docker compose up -d`를 실행하며, 이후 컨테이너 재시작은
+Docker의 `unless-stopped` 정책이 담당한다. `active (exited)`는 정상 상태다.
 
 ## 업데이트
 

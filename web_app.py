@@ -1,12 +1,15 @@
 """Read-only web dashboard for futures paper-trading databases."""
 
 from datetime import datetime, timezone
+from contextlib import closing
+import logging
+import secrets
 import json
 import os
 from pathlib import Path
 import sqlite3
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.responses import HTMLResponse, JSONResponse
 
 
@@ -19,6 +22,7 @@ app = FastAPI(
     version="1.0.0",
     docs_url=None,
     redoc_url=None,
+    openapi_url=None,
 )
 
 
@@ -46,7 +50,8 @@ def read_dashboard_database(path, recent_limit=RECENT_LIMIT):
         raise ValueError("recent_limit must be between 1 and 100")
 
     source = Path(path)
-    with _database_connection(source) as database:
+    with closing(_database_connection(source)) as database:
+        database.execute('BEGIN')
         row = database.execute("SELECT data FROM state WHERE id=1").fetchone()
         if row is None:
             raise ValueError("Database has no state row")
@@ -64,6 +69,10 @@ def read_dashboard_database(path, recent_limit=RECENT_LIMIT):
                 payload = json.loads(item["payload"])
             except json.JSONDecodeError:
                 payload = {}
+            if not isinstance(payload, dict):
+                payload = {}
+            payload.setdefault('price', next((payload[key] for key in
+                ('mark_price', 'entry_price', 'exit_price') if payload.get(key) is not None), None))
             events.append(
                 {
                     "candle": item["candle"],
@@ -123,7 +132,8 @@ def build_dashboard(data_directory=DATA_DIRECTORY, recent_limit=RECENT_LIMIT):
         try:
             accounts.append(read_dashboard_database(path, recent_limit))
         except (OSError, sqlite3.Error, ValueError, json.JSONDecodeError) as error:
-            errors.append({"database": path.name, "error": str(error)})
+            logging.getLogger(__name__).exception('Cannot read dashboard database %s', path.name)
+            errors.append({"database": path.name, "error": 'database_read_error'})
     return {
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "accounts": accounts,
@@ -133,14 +143,17 @@ def build_dashboard(data_directory=DATA_DIRECTORY, recent_limit=RECENT_LIMIT):
 
 @app.middleware("http")
 async def security_headers(request, call_next):
+    request.state.csp_nonce = secrets.token_urlsafe(24)
     response = await call_next(request)
     response.headers["Cache-Control"] = "no-store"
     response.headers["X-Content-Type-Options"] = "nosniff"
     response.headers["X-Frame-Options"] = "DENY"
     response.headers["Referrer-Policy"] = "no-referrer"
     response.headers["Content-Security-Policy"] = (
-        "default-src 'self'; style-src 'self' 'unsafe-inline'; "
-        "script-src 'self' 'unsafe-inline'; connect-src 'self'"
+        "default-src 'self'; "
+        f"style-src 'self' 'nonce-{request.state.csp_nonce}'; "
+        f"script-src 'self' 'nonce-{request.state.csp_nonce}'; "
+        "connect-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'"
     )
     return response
 
@@ -162,7 +175,7 @@ DASHBOARD_HTML = r"""<!doctype html>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width,initial-scale=1">
   <title>CoinPilot Lab</title>
-  <style>
+  <style nonce="__CSP_NONCE__">
     :root { color-scheme: dark; --bg:#080b12; --panel:#111827; --line:#253047;
       --text:#f3f6fb; --muted:#91a0b8; --green:#2dd4a7; --red:#fb7185; --blue:#60a5fa; }
     * { box-sizing:border-box; }
@@ -205,8 +218,8 @@ DASHBOARD_HTML = r"""<!doctype html>
   <section class="section"><h2>최근 전략 판단</h2><div class="table-wrap" id="events"></div></section>
   <div id="errors"></div>
 </main>
-<script>
-const money = value => Number(value || 0).toLocaleString('ko-KR',{minimumFractionDigits:2,maximumFractionDigits:2});
+<script nonce="__CSP_NONCE__">
+const money = value => value == null ? '-' : Number(value).toLocaleString('ko-KR',{minimumFractionDigits:2,maximumFractionDigits:2});
 const when = value => value ? new Date(Number(value)).toLocaleString('ko-KR') : '-';
 const pnlClass = value => Number(value) >= 0 ? 'positive' : 'negative';
 const esc = value => String(value ?? '-').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
@@ -238,5 +251,5 @@ refresh(); setInterval(refresh,30000);
 
 
 @app.get("/", response_class=HTMLResponse)
-def dashboard_page():
-    return HTMLResponse(DASHBOARD_HTML)
+def dashboard_page(request: Request):
+    return HTMLResponse(DASHBOARD_HTML.replace('__CSP_NONCE__', request.state.csp_nonce))
